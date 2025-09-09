@@ -388,10 +388,14 @@ def run(query: str):
     graph = orchestrator.build_graph().compile()
 
     # Execute the graph
-    state = graph.invoke(state)
+    result = graph.invoke(state)
 
     # Final output
-    recommended = state.final_recommendation or {}
+    if isinstance(result, dict):
+        recommended = result.get("final_recommendation") or {}
+    else:
+        recommended = getattr(result, "final_recommendation", None) or {}
+
     if not recommended:
         console.print("[red]Не удалось сформировать рекомендацию[/red]")
         sys.exit(2)
