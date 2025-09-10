@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Executable multi-agent product recommender using LangGraph + Ollama (mannix/phi3-mini-4k:latest).
+Executable multi-agent product recommender using LangGraph + Hugging Face Transformers.
 - Reads agents from agents_list.csv (last one should be Coordinator Agent).
 - Reads catalog from data/27181_all_cards.csv (tab-separated).
 - Accepts a natural language query and outputs one recommended product.
@@ -10,12 +10,11 @@ Executable multi-agent product recommender using LangGraph + Ollama (mannix/phi3
 
 Prerequisites:
   1) Install Python deps (examples):
-     pip install rich langgraph langchain langchain-ollama ollama
-  2) Ensure Ollama is running locally and the model is available:
-     ollama pull mannix/phi3-mini-4k:latest
+     pip install -r requirements.txt
+  2) Ensure an HF model name is available (env HF_MODEL). Example defaults to Qwen/Qwen2.5-3B-Instruct.
 
 Run:
-  python main.py --query "Ищу теплую рубашку в клетку на осень"
+  HF_MODEL="Qwen/Qwen2.5-3B-Instruct" python main.py --query "Ищу теплую рубашку в клетку на осень"
   or just: python main.py (you will be prompted)
 """
 
@@ -31,14 +30,9 @@ from typing import Dict, List, Any, Optional, Tuple
 # LangGraph
 from langgraph.graph import StateGraph, END
 
-# LLM via LangChain + Ollama (fallback compatible)
-try:
-    from langchain_ollama import ChatOllama
-except Exception:  # fallback to community import name
-    try:
-        from langchain_community.chat_models import ChatOllama  # type: ignore
-    except Exception:
-        ChatOllama = None  # we will check at runtime
+# Hugging Face Transformers for LLM
+from transformers import AutoTokenizer, pipeline
+import torch
 
 # Rich for pretty streaming output
 from rich.console import Console
@@ -48,7 +42,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 from rich.table import Table
 
-MODEL_NAME = os.environ.get("OLLAMA_MODEL", "mannix/phi3-mini-4k:latest")
+MODEL_NAME = os.environ.get("HF_MODEL", "Qwen/Qwen-7B-Chat")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENTS_CSV = os.path.join(ROOT_DIR, "agents_list.csv")
 DATA_CSV = os.path.join(ROOT_DIR, "data", "27181_all_cards.csv")
@@ -161,25 +155,110 @@ class LLMFacade:
     model_name: str = MODEL_NAME
     temperature: float = 0.3
 
+    # class-level cache to avoid reloading model multiple times
+    _pipe = None
+    _tokenizer = None
+
+    def _ensure_loaded(self):
+        if self.__class__._pipe is not None and self.__class__._tokenizer is not None:
+            return
+        # Load tokenizer and model with a local-first strategy; download from HF if missing
+        # 1) Try local cache only
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                self.model_name, use_fast=True, trust_remote_code=True, local_files_only=True
+            )
+            local_only = True
+        except Exception:
+            local_only = False
+            console.print(
+                f"[yellow]Модель не найдена в локальном кэше. Загрузка с Hugging Face: [bold]{self.model_name}[/bold][/yellow]"
+            )
+            tok = AutoTokenizer.from_pretrained(self.model_name, use_fast=True, trust_remote_code=True)
+
+        # Prepare model
+        try:
+            from transformers import AutoModelForCausalLM  # lazy import to keep top-level clean
+        except Exception as e:
+            raise RuntimeError(f"Не удалось импортировать AutoModelForCausalLM: {e}")
+
+        model_kwargs = {"trust_remote_code": True}
+        dtype = None
+        if torch.cuda.is_available():
+            # Prefer GPU if available
+            model_kwargs.update({"device_map": "auto"})
+            dtype = torch.float16
+        # Try to load model from local cache only first
+        try:
+            if local_only:
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name, local_files_only=True, trust_remote_code=True, torch_dtype=dtype
+                )
+            else:
+                # We already know it's not local; go ahead and download
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name, trust_remote_code=True, torch_dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
+                )
+        except Exception:
+            # If local-only attempt failed, fall back to download
+            console.print(
+                f"[yellow]Загружаем веса модели с Hugging Face (может занять время) — [bold]{self.model_name}[/bold][/yellow]"
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_name, trust_remote_code=True, torch_dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
+            )
+
+        # Build generation pipeline
+        pipe_kwargs = {
+            "model": model,
+            "tokenizer": tok,
+            "task": "text-generation",
+            "trust_remote_code": True,
+        }
+        gen = pipeline(**pipe_kwargs, trust_remote_code=True)
+        self.__class__._pipe = gen
+        self.__class__._tokenizer = tok
+
     def is_available(self) -> bool:
-        return ChatOllama is not None
+        try:
+            self._ensure_loaded()
+            return True
+        except Exception:
+            return False
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        if ChatOllama is None:
-            return (
-                "[LLM unavailable] Please install langchain-ollama and run Ollama with model "
-                f"{self.model_name}."
-            )
-        llm = ChatOllama(model=self.model_name, temperature=self.temperature)
-        msgs = [
-            ("system", system_prompt),
-            ("user", user_prompt),
+        self._ensure_loaded()
+        tok = self.__class__._tokenizer
+        pipe = self.__class__._pipe
+        # Use chat template if available
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ]
-        # Convert to langchain message format
-        from langchain.schema import SystemMessage, HumanMessage
-        lc_msgs = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-        out = llm.invoke(lc_msgs)
-        return getattr(out, "content", str(out))
+        try:
+            prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            # Fallback simple formatting
+            prompt = (
+                f"<|system|>\n{system_prompt}\n</s>\n<|user|>\n{user_prompt}\n</s>\n<|assistant|>\n"
+            )
+        max_new = 512
+        outputs = pipe(
+            prompt,
+            max_new_tokens=max_new,
+            do_sample=True,
+            temperature=max(0.01, float(self.temperature)),
+            top_p=0.95,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=getattr(tok, "pad_token_id", tok.eos_token_id),
+        )
+        text = outputs[0]["generated_text"]
+        # If pipeline returns the full prompt + continuation, strip the prompt prefix
+        if text.startswith(prompt):
+            text = text[len(prompt):]
+        # Trim any stray end tokens
+        text = text.strip()
+        return text
 
 
 # -----------------------------
@@ -372,16 +451,17 @@ def run(query: str):
         sys.exit(1)
 
     # Intro
-    console.rule("Мультиагентная рекомендация (LangGraph + Ollama)")
+    console.rule("Мультиагентная рекомендация (LangGraph + Transformers)")
     console.print(f"Модель: [bold]{MODEL_NAME}[/bold]")
     console.print(f"Запрос пользователя: [bold]{query}[/bold]\n")
 
     llm = LLMFacade(model_name=MODEL_NAME, temperature=0.3)
     if not llm.is_available():
-        console.print("[yellow]Внимание:[/yellow] LLM недоступен в среде Python.\n"
-                      "Убедитесь, что установлены зависимости и запущен Ollama:\n"
-                      "  pip install langchain-ollama ollama langchain\n"
-                      f"  ollama pull {MODEL_NAME}\n")
+        console.print("[yellow]Внимание:[/yellow] LLM (Transformers) недоступен/не загружен.\n"
+                      "Убедитесь, что установлены зависимости и указан корректный HF_MODEL:\n"
+                      "  pip install -r requirements.txt\n"
+                      "  set HF_MODEL=Qwen/Qwen2.5-3B-Instruct\n"
+                      "  # либо другой поддерживаемый чатовый LLM на Hugging Face\n")
 
     orchestrator = AgentsOrchestrator(agents, llm)
     state = RecoState(query=query, catalog=catalog)
@@ -426,7 +506,7 @@ def run(query: str):
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Multi-agent product recommender (LangGraph + Ollama)")
+    parser = argparse.ArgumentParser(description="Multi-agent product recommender (LangGraph + Transformers)")
     parser.add_argument("--query", "-q", type=str, help="Пользовательский запрос на естественном языке")
     return parser.parse_args(argv)
 

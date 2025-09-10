@@ -4,12 +4,19 @@ rich>=13.7.0
 # LangGraph for workflow orchestration
 langgraph>=0.2.30
 
-# LangChain core and community split (v0.2+)
+# (Optional) LangChain core used by LangGraph internals in some setups
 langchain>=0.2.10
 langchain-community>=0.2.10
 
-# Ollama integration (choose either langchain-ollama or community fallback in code)
-langchain-ollama>=0.1.0
-
-# Python client for a running local Ollama server
-ollama>=0.3.0
+# Transformers-based LLM
+transformers>=4.43.0
+# Explicit HF utils for downloading and caching models
+huggingface-hub>=0.23.0
+# Torch with platform markers
+torch>=2.1; platform_system != "Windows"
+torch>=2.2; platform_system == "Windows"
+accelerate>=0.30.0
+safetensors>=0.4.2
+sentencepiece>=0.1.99
+# Chat template rendering in Transformers can require Jinja2
+jinja2>=3.1.0
