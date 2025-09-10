@@ -69,55 +69,107 @@ def tokenize_query(q: str) -> List[str]:
 
 def load_agents(path: str) -> List[Dict[str, Any]]:
     """Load agents from CSV.
-    Supports new format with headers: Агент, Роль, Личность, Поддержка tooling?
+    Supports new format with headers: Агент, Роль, Личность, Tooling/Поддержка tooling?, Промпт/Prompt.
     Falls back to legacy 3-column format (name, expertise, collab).
+    Also performs lenient parsing and text cleanup to handle HTML <br> and stray quotes.
     """
     agents: List[Dict[str, Any]] = []
+
+    def clean_text(raw: str) -> str:
+        # Normalize line breaks inside fields: replace HTML <br> with space
+        s = raw.replace("<br>", " ")
+        # Normalize quotes
+        for a in ['“', '”', '„', '‟', '❝', '❞', '«', '»']:
+            s = s.replace(a, '"')
+        # Replace doubled quotes "" -> "
+        s = s.replace('""', '"')
+        return s
+
+    def lenient_split(line: str, delimiter: str = ',', expected_cols: int = 5) -> List[str]:
+        # Split by delimiter but respect quotes; tolerate unbalanced quotes by not splitting inside quotes until end
+        out: List[str] = []
+        buf = []
+        in_quote = False
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '"':
+                # toggle in_quote unless escaped by double quote
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    # escaped quote, keep one and skip next
+                    buf.append('"')
+                    i += 2
+                    continue
+                in_quote = not in_quote
+                # do not include the quote itself
+                i += 1
+                continue
+            if ch == delimiter and not in_quote:
+                out.append(''.join(buf))
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+        out.append(''.join(buf))
+        # Pad or merge to expected cols
+        if len(out) < expected_cols:
+            out += [''] * (expected_cols - len(out))
+        elif len(out) > expected_cols:
+            # merge extras into last field
+            last = ','.join(out[expected_cols - 1:])
+            out = out[:expected_cols - 1] + [last]
+        return [part.strip() for part in out]
+
     with open(path, "r", encoding="utf-8-sig") as f:
-        # Try DictReader first
-        text = f.read()
-        f.seek(0)
+        raw_text = f.read()
+        if not raw_text.strip():
+            return []
+        text = clean_text(raw_text)
+        # Sniff header and delimiter on cleaned text
         sniffer = csv.Sniffer()
-        has_header = False
+        has_header = True
         try:
-            has_header = sniffer.has_header(text[:2048])
+            has_header = sniffer.has_header(text[:4096])
         except Exception:
             has_header = True
-        # Detect delimiter
         delimiter = ","
-        sample = text[:2048]
         try:
-            dialect = sniffer.sniff(sample, delimiters=",;\t")
+            dialect = sniffer.sniff(text[:4096], delimiters=",;\t")
             delimiter = dialect.delimiter
         except Exception:
-            first_line = sample.splitlines()[0] if sample else ""
+            first_line = text.splitlines()[0] if text else ""
             if "\t" in first_line:
                 delimiter = "\t"
             elif ";" in first_line and "," not in first_line:
                 delimiter = ";"
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return []
         if has_header:
-            f.seek(0)
-            reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
-            for row in reader:
+            headers = [h.strip() for h in lenient_split(lines[0], delimiter=delimiter, expected_cols=10)]
+            # Build rows using lenient splitter to be robust to stray quotes
+            for ln in lines[1:]:
+                cols = lenient_split(ln, delimiter=delimiter, expected_cols=len(headers))
+                row = {headers[i]: (cols[i] if i < len(cols) else '') for i in range(len(headers))}
                 if not row:
                     continue
-                # Normalize keys (strip spaces)
+                # Normalize keys lookup function
                 def g(key: str) -> str:
                     key_norm = key.strip().lower().replace("?", "")
-                    for k in row.keys():
-                        if k is None:
-                            continue
-                        kk = (str(k).lstrip("\ufeff").strip().lower().replace("?", ""))
+                    for k, v in row.items():
+                        kk = str(k).lstrip("\ufeff").strip().lower().replace("?", "")
                         if kk == key_norm:
-                            return row[k] or ""
+                            return v or ""
                     return ""
-                # Map Russian headers to internal fields
-                name = (g("агент") or g("agent")).strip()
+                # Map headers to internal fields
+                name = (g("агент") or g("agent") or g("name")).strip()
                 role = (g("роль") or g("role")).strip()
                 persona = (g("личность") or g("persona") or g("персона")).strip()
                 tooling_raw = (g("поддержка tooling") or g("tooling") or g("supports tooling") or g("поддержка инструментов")).strip()
+                prompt_text = (g("промпт") or g("prompt") or g("инструкция") or g("system") or g("instruction")).strip()
                 if not name and g("name"):
-                    # legacy
+                    # legacy-like mislabeled
                     agents.append({
                         "name": g("name").strip(),
                         "expertise": g("expertise").strip(),
@@ -125,6 +177,7 @@ def load_agents(path: str) -> List[Dict[str, Any]]:
                         "role": g("expertise").strip(),
                         "persona": g("collab").strip(),
                         "tooling": False,
+                        "prompt": prompt_text,
                     })
                     continue
                 if not name:
@@ -134,28 +187,28 @@ def load_agents(path: str) -> List[Dict[str, Any]]:
                 tooling = False
                 if tooling_val:
                     t = tooling_val.strip().lower()
-                    tooling = t in ("да", "true", "y", "yes", "✅", "1", "ok") or "✅" in tooling_val
+                    tooling = t in ("да", "true", "y", "yes", "✅", "1", "ok") or "✅" in tooling_val or t == '1'
                 agents.append({
                     "name": name,
                     "role": role,
                     "persona": persona,
                     "tooling": tooling,
+                    "prompt": prompt_text,
                 })
         else:
-            f.seek(0)
-            reader = csv.reader(f, delimiter=delimiter, skipinitialspace=True)
-            for row in reader:
-                if not row or len(row) < 3:
+            # Legacy: no header, 3 columns minimal
+            for ln in lines:
+                cols = lenient_split(ln, delimiter=delimiter, expected_cols=3)
+                if not cols or len(cols) < 3:
                     continue
                 agents.append({
-                    "name": row[0].strip(),
-                    "expertise": row[1].strip(),
-                    "collab": row[2].strip(),
-                    "role": row[1].strip(),
-                    "persona": row[2].strip(),
+                    "name": cols[0].strip(),
+                    "expertise": cols[1].strip(),
+                    "collab": cols[2].strip(),
+                    "role": cols[1].strip(),
+                    "persona": cols[2].strip(),
                     "tooling": False,
                 })
-    # Ensure "Wardrobe Agent" exists if present in CSV; otherwise keep order
     return agents
 
 
@@ -274,6 +327,7 @@ class LLMFacade:
     # class-level cache to avoid reloading model multiple times
     _pipe = None
     _tokenizer = None
+    _model = None
 
     def _ensure_loaded(self):
         if self.__class__._pipe is not None and self.__class__._tokenizer is not None:
@@ -324,6 +378,43 @@ class LLMFacade:
                 self.model_name, trust_remote_code=True, dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
             )
 
+        # Ensure tokenizer/model have proper pad/eos to avoid NoneType errors inside generation
+        try:
+            # Prefer existing eos; some models don't define pad_token — set it to eos to enable attention_mask
+            if getattr(tok, "pad_token_id", None) is None:
+                # Try to reuse eos/unk tokens
+                if getattr(tok, "eos_token", None):
+                    tok.pad_token = tok.eos_token
+                elif getattr(tok, "unk_token", None):
+                    tok.pad_token = tok.unk_token
+                else:
+                    # add a new pad token
+                    tok.add_special_tokens({"pad_token": "<|pad|>"})
+                    # If we added a pad token, resize model embeddings safely
+                    try:
+                        model.resize_token_embeddings(len(tok))
+                    except Exception:
+                        pass
+            # Mirror into model configs if available
+            if hasattr(model, "config") and getattr(model.config, "pad_token_id", None) is None and getattr(tok, "pad_token_id", None) is not None:
+                model.config.pad_token_id = tok.pad_token_id
+            # Some models miss eos in tokenizer but define it in config; try to sync
+            if getattr(tok, "eos_token_id", None) is None and hasattr(model, "config") and getattr(model.config, "eos_token_id", None) is not None:
+                try:
+                    tok.eos_token_id = model.config.eos_token_id
+                except Exception:
+                    pass
+        except Exception:
+            # Soft-fail; better to proceed than crash here
+            pass
+
+        # Optionally set safer padding side for causal models
+        try:
+            if getattr(tok, "padding_side", None) != "left":
+                tok.padding_side = "left"
+        except Exception:
+            pass
+
         # Build generation pipeline
         pipe_kwargs = {
             "model": model,
@@ -331,9 +422,15 @@ class LLMFacade:
             "task": "text-generation",
             "trust_remote_code": True,
         }
-        gen = pipeline(**pipe_kwargs, trust_remote_code=True)
+        # Put model to eval mode for stable generation
+        try:
+            model.eval()
+        except Exception:
+            pass
+        gen = pipeline(**pipe_kwargs)
         self.__class__._pipe = gen
         self.__class__._tokenizer = tok
+        self.__class__._model = model
 
     def is_available(self) -> bool:
         try:
@@ -359,22 +456,66 @@ class LLMFacade:
                 f"<|system|>\n{system_prompt}\n</s>\n<|user|>\n{user_prompt}\n</s>\n<|assistant|>\n"
             )
         max_new = 512
-        outputs = pipe(
-            prompt,
+        # Build safe generation kwargs
+        gen_kwargs = dict(
             max_new_tokens=max_new,
             do_sample=True,
             temperature=max(0.01, float(self.temperature)),
             top_p=0.95,
-            eos_token_id=tok.eos_token_id,
-            pad_token_id=getattr(tok, "pad_token_id", tok.eos_token_id),
         )
-        text = outputs[0]["generated_text"]
-        # If pipeline returns the full prompt + continuation, strip the prompt prefix
-        if text.startswith(prompt):
-            text = text[len(prompt):]
-        # Trim any stray end tokens
-        text = text.strip()
-        return text
+        if getattr(tok, "eos_token_id", None) is not None:
+            gen_kwargs["eos_token_id"] = tok.eos_token_id
+        pad_id = getattr(tok, "pad_token_id", None)
+        if pad_id is None and getattr(tok, "eos_token_id", None) is not None:
+            pad_id = tok.eos_token_id
+        if pad_id is not None:
+            gen_kwargs["pad_token_id"] = pad_id
+        try:
+            outputs = pipe(
+                prompt,
+                **gen_kwargs,
+            )
+            text = outputs[0]["generated_text"]
+            # If pipeline returns the full prompt + continuation, strip the prompt prefix
+            if text.startswith(prompt):
+                text = text[len(prompt):]
+            # Trim any stray end tokens
+            text = text.strip()
+            return text
+        except Exception as e:
+            # Fallback to manual generation to avoid pipeline-specific issues (e.g., NoneType .size())
+            model = self.__class__._model
+            if model is None:
+                raise e
+            # Determine device from model parameters
+            try:
+                first_param = next(model.parameters())
+                device = first_param.device
+            except Exception:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # Tokenize input and move to device
+            inputs = tok(prompt, return_tensors="pt")
+            # Ensure attention mask exists
+            if "attention_mask" not in inputs or inputs["attention_mask"] is None:
+                inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            # Ensure eos/pad in kwargs for generate
+            man_kwargs = dict(gen_kwargs)
+            if getattr(tok, "eos_token_id", None) is not None:
+                man_kwargs["eos_token_id"] = tok.eos_token_id
+            pad_id = getattr(tok, "pad_token_id", None)
+            if pad_id is None and getattr(tok, "eos_token_id", None) is not None:
+                pad_id = tok.eos_token_id
+            if pad_id is not None:
+                man_kwargs["pad_token_id"] = pad_id
+            with torch.no_grad():
+                out_ids = model.generate(**inputs, **man_kwargs)
+            gen_ids = out_ids[0]
+            # Cut the prompt part to get only newly generated tokens
+            input_len = inputs["input_ids"].shape[1]
+            new_ids = gen_ids[input_len:]
+            text = tok.decode(new_ids, skip_special_tokens=True).strip()
+            return text
 
 
 # -----------------------------
@@ -397,7 +538,7 @@ class AgentsOrchestrator:
             raise ValueError("No agents provided. Check agents_list.csv")
         self.agents = agents
         # Determine main agent (Wardrobe Agent) as coordinator if present
-        ward = next((a for a in agents if a.get("name", "").strip().lower() == "wardrobe agent".lower()), None)
+        ward = next((a for a in agents if "wardrobe agent" in a.get("name", "").strip().lower()), None)
         if ward:
             self.coordinator_name = ward["name"].strip()
         else:
@@ -431,8 +572,10 @@ class AgentsOrchestrator:
         supports_tooling = bool(agent.get("tooling"))
         color = self.colors.get(name, "white")
 
+        extra_prompt = (agent.get("prompt") or "").strip()
+        extra_block = ("\nДоп. инструкция для этого агента:\n" + extra_prompt.strip() + "\n") if extra_prompt else ""
         system_prompt = f"""
-Вы — {name}. Роль: {role}. Личность: {persona}.
+Вы — {name}. Роль: {role}. Личность: {persona}.{extra_block}
 Вы — часть мультиагентной команды рекомендаций одежды и обуви.
 Если доступен tooling: можно использовать краткие факты из раздела "Данные из инструментов".
 Задача: изучить запрос пользователя и шорт-лист кандидатов и предложить, кого рекомендовать и почему.
@@ -490,8 +633,10 @@ class AgentsOrchestrator:
         tools_text = simulate_tool_data(coord_meta, state.shortlist, state.query)
         tools_block = f"\nИНСТРУМЕНТЫ (сводка):\n{tools_text}\n" if tools_text else ""
 
+        extra_prompt = (coord_meta.get("prompt") or "").strip()
+        extra_block = ("\nДоп. инструкция для координатора:\n" + extra_prompt.strip() + "\n") if extra_prompt else ""
         system_prompt = f"""
-Вы — {name}. Роль: {role}. Личность: {persona}.
+Вы — {name}. Роль: {role}. Личность: {persona}.{extra_block}
 Вы руководите обсуждением, формулируете гипотезу о стиле/потребности пользователя и принимаете финальное решение.
 Цель: выбрать один лучший товар для рекомендации с учётом запроса, шорт-листа, мнений агентов и данных инструментов.
 Критерии: соответствие запросу, уместность для ситуации (occasion), качество (mark), цвет/категория/бренд.
