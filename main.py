@@ -46,6 +46,7 @@ MODEL_NAME = os.environ.get("HF_MODEL", "Qwen/Qwen-7B-Chat")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENTS_CSV = os.path.join(ROOT_DIR, "agents_list.csv")
 DATA_CSV = os.path.join(ROOT_DIR, "data", "27181_all_cards.csv")
+SLOGAN = "Haven is ready to dress you. 👔🧥👢"
 
 console = Console()
 
@@ -585,6 +586,7 @@ def run(query: str):
 
     # Intro
     console.rule("Мультиагентная рекомендация (LangGraph + Transformers)")
+    console.print(f"[bold cyan]{SLOGAN}[/bold cyan]")
     console.print(f"Модель: [bold]{MODEL_NAME}[/bold]")
     console.print(f"Запрос пользователя: [bold]{query}[/bold]\n")
 
