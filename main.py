@@ -66,19 +66,95 @@ def tokenize_query(q: str) -> List[str]:
     return [t for t in tokens if t]
 
 
-def load_agents(path: str) -> List[Dict[str, str]]:
-    agents: List[Dict[str, str]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        for row in reader:
-            if not row or len(row) < 3:
-                continue
-            agents.append({
-                "name": row[0].strip(),
-                "expertise": row[1].strip(),
-                "collab": row[2].strip(),
-            })
+def load_agents(path: str) -> List[Dict[str, Any]]:
+    """Load agents from CSV.
+    Supports new format with headers: Агент, Роль, Личность, Поддержка tooling?
+    Falls back to legacy 3-column format (name, expertise, collab).
+    """
+    agents: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        # Try DictReader first
+        text = f.read()
+        f.seek(0)
+        sniffer = csv.Sniffer()
+        has_header = False
+        try:
+            has_header = sniffer.has_header(text[:2048])
+        except Exception:
+            has_header = True
+        # Detect delimiter
+        delimiter = ","
+        sample = text[:2048]
+        try:
+            dialect = sniffer.sniff(sample, delimiters=",;\t")
+            delimiter = dialect.delimiter
+        except Exception:
+            first_line = sample.splitlines()[0] if sample else ""
+            if "\t" in first_line:
+                delimiter = "\t"
+            elif ";" in first_line and "," not in first_line:
+                delimiter = ";"
+        if has_header:
+            f.seek(0)
+            reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
+            for row in reader:
+                if not row:
+                    continue
+                # Normalize keys (strip spaces)
+                def g(key: str) -> str:
+                    key_norm = key.strip().lower().replace("?", "")
+                    for k in row.keys():
+                        if k is None:
+                            continue
+                        kk = (str(k).lstrip("\ufeff").strip().lower().replace("?", ""))
+                        if kk == key_norm:
+                            return row[k] or ""
+                    return ""
+                # Map Russian headers to internal fields
+                name = (g("агент") or g("agent")).strip()
+                role = (g("роль") or g("role")).strip()
+                persona = (g("личность") or g("persona") or g("персона")).strip()
+                tooling_raw = (g("поддержка tooling") or g("tooling") or g("supports tooling") or g("поддержка инструментов")).strip()
+                if not name and g("name"):
+                    # legacy
+                    agents.append({
+                        "name": g("name").strip(),
+                        "expertise": g("expertise").strip(),
+                        "collab": g("collab").strip(),
+                        "role": g("expertise").strip(),
+                        "persona": g("collab").strip(),
+                        "tooling": False,
+                    })
+                    continue
+                if not name:
+                    # skip malformed line
+                    continue
+                tooling_val = tooling_raw
+                tooling = False
+                if tooling_val:
+                    t = tooling_val.strip().lower()
+                    tooling = t in ("да", "true", "y", "yes", "✅", "1", "ok") or "✅" in tooling_val
+                agents.append({
+                    "name": name,
+                    "role": role,
+                    "persona": persona,
+                    "tooling": tooling,
+                })
+        else:
+            f.seek(0)
+            reader = csv.reader(f, delimiter=delimiter, skipinitialspace=True)
+            for row in reader:
+                if not row or len(row) < 3:
+                    continue
+                agents.append({
+                    "name": row[0].strip(),
+                    "expertise": row[1].strip(),
+                    "collab": row[2].strip(),
+                    "role": row[1].strip(),
+                    "persona": row[2].strip(),
+                    "tooling": False,
+                })
+    # Ensure "Wardrobe Agent" exists if present in CSV; otherwise keep order
     return agents
 
 
@@ -146,6 +222,45 @@ def product_brief(item: Dict[str, Any]) -> str:
     return ", ".join([f for f in fields if f])
 
 
+def simulate_tool_data(agent: Dict[str, Any], shortlist: List[Dict[str, Any]], query: str) -> str:
+    """Return constant tool outputs based on agent capabilities and name.
+    This simulates external services until real tooling is implemented.
+    """
+    if not agent.get("tooling"):
+        return ""
+    name = agent.get("name", "")
+    # Prepare some deterministic but simple data based on shortlist
+    top = shortlist[:3] if shortlist else []
+    if name.lower().startswith("weather"):
+        return (
+            "Погода: Москва — сейчас 18°C, облачно, ветер 4 м/с. Выходные: 16–19°C, возможен лёгкий дождь. "
+            "Рекомендации: многослойность, утеплённые материалы, влагозащита для обуви."
+        )
+    if name.lower().startswith("retail"):
+        lines = []
+        base_prices = [4990, 6990, 8990]
+        for i, it in enumerate(top):
+            nm = it.get("name", "товар").strip() or f"товар {i+1}"
+            price = base_prices[i % len(base_prices)]
+            lines.append(f"- '{nm}': в наличии в 'Haven Store', цена ~{price} ₽")
+        if not lines:
+            lines.append("- Нет кандидатов для проверки наличия.")
+        return "Наличие и цены:\n" + "\n".join(lines)
+    if name.lower().startswith("wardrobe"):
+        # Wardrobe Agent can see a concise summary from weather and retail
+        retail_lines = []
+        base_prices = [4990, 6990, 8990]
+        for i, it in enumerate(top):
+            nm = it.get("name", "товар").strip() or f"товар {i+1}"
+            price = base_prices[i % len(base_prices)]
+            retail_lines.append(f"• {nm} — в наличии, ~{price} ₽")
+        retail = "; ".join(retail_lines) if retail_lines else "нет данных"
+        weather = "Москва: 18°C, облачно; на выходных 16–19°C, возможен дождь"
+        return f"Сводка инструментов: погода: {weather}. Ритейл: {retail}."
+    # default for any other tool-enabled agent
+    return "Инструменты готовы, данных пока нет."
+
+
 # -----------------------------
 # LLM Wrapper
 # -----------------------------
@@ -192,12 +307,12 @@ class LLMFacade:
         try:
             if local_only:
                 model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name, local_files_only=True, trust_remote_code=True, torch_dtype=dtype
+                    self.model_name, local_files_only=True, trust_remote_code=True, dtype=dtype
                 )
             else:
                 # We already know it's not local; go ahead and download
                 model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name, trust_remote_code=True, torch_dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
+                    self.model_name, trust_remote_code=True, dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
                 )
         except Exception:
             # If local-only attempt failed, fall back to download
@@ -205,7 +320,7 @@ class LLMFacade:
                 f"[yellow]Загружаем веса модели с Hugging Face (может занять время) — [bold]{self.model_name}[/bold][/yellow]"
             )
             model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, trust_remote_code=True, torch_dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
+                self.model_name, trust_remote_code=True, dtype=dtype, device_map="auto" if torch.cuda.is_available() else None
             )
 
         # Build generation pipeline
@@ -276,11 +391,17 @@ class RecoState:
 
 
 class AgentsOrchestrator:
-    def __init__(self, agents: List[Dict[str, str]], llm: LLMFacade):
+    def __init__(self, agents: List[Dict[str, Any]], llm: LLMFacade):
         if not agents:
             raise ValueError("No agents provided. Check agents_list.csv")
         self.agents = agents
-        self.coordinator_name = agents[-1]["name"].strip()
+        # Determine main agent (Wardrobe Agent) as coordinator if present
+        ward = next((a for a in agents if a.get("name", "").strip().lower() == "wardrobe agent".lower()), None)
+        if ward:
+            self.coordinator_name = ward["name"].strip()
+        else:
+            # fall back to first agent as main
+            self.coordinator_name = agents[0]["name"].strip()
         self.llm = llm
         self.colors = self._assign_colors([a["name"] for a in agents])
 
@@ -302,20 +423,22 @@ class AgentsOrchestrator:
         return state
 
     # Nodes: individual agents
-    def make_agent_node(self, agent: Dict[str, str]):
+    def make_agent_node(self, agent: Dict[str, Any]):
         name = agent["name"]
-        expertise = agent["expertise"]
-        collab = agent["collab"]
+        role = agent.get("role", agent.get("expertise", ""))
+        persona = agent.get("persona", agent.get("collab", ""))
+        supports_tooling = bool(agent.get("tooling"))
         color = self.colors.get(name, "white")
 
         system_prompt = f"""
-Вы — {name}. Ваша экспертиза: {expertise}. Коллаборация: {collab}.
-Вы работаете в мультиагентной системе рекомендаций. Контекст общий.
-Задача: изучить запрос пользователя и краткий список кандидатов и предложить, кого рекомендовать и почему.
+Вы — {name}. Роль: {role}. Личность: {persona}.
+Вы — часть мультиагентной команды рекомендаций одежды и обуви.
+Если доступен tooling: можно использовать краткие факты из раздела "Данные из инструментов".
+Задача: изучить запрос пользователя и шорт-лист кандидатов и предложить, кого рекомендовать и почему.
 Формат вывода:
-- Критерии и соображения (коротко)
-- 1-2 подходящих кандидата с кратким обоснованием в одну строку на каждого (укажите name или brand)
-- Возможные риски или проверку для координатора
+- Критерии (коротко, применительно к одежде/обуви и стилю)
+- 1–2 подходящих кандидата с обоснованием в одну строку (укажите name или brand)
+- Возможные риски или что проверить
 Пишите по-русски, сжато.
 """.strip()
 
@@ -324,10 +447,13 @@ class AgentsOrchestrator:
             shortlist_str = "\n".join(
                 [f"{i+1}. {product_brief(it)}" for i, it in enumerate(state.shortlist[:6])]
             )
+            tools_text = simulate_tool_data(agent, state.shortlist, state.query)
+            tools_block = f"\nДанные из инструментов:\n{tools_text}\n" if tools_text else ""
             user_prompt = f"""
 Пользовательский запрос: {state.query}
 Кандидаты (сокращённый список):
 {shortlist_str}
+{tools_block}
 Сделайте свои рекомендации.
 """.strip()
             try:
@@ -346,6 +472,10 @@ class AgentsOrchestrator:
     def node_coordinator(self, state: RecoState) -> RecoState:
         name = self.coordinator_name
         color = self.colors.get(name, "white")
+        # Find coordinator meta
+        coord_meta = next((a for a in self.agents if a.get("name", "").strip() == name), {})
+        role = coord_meta.get("role", "Главный агент-координатор (одежда/обувь)")
+        persona = coord_meta.get("persona", "Дружелюбный стилист, заботливый, немного ироничный")
 
         # Build combined suggestions
         combined = []
@@ -355,14 +485,17 @@ class AgentsOrchestrator:
             combined.append(f"[{agent_name}]\n{text}")
         combined_text = "\n\n".join(combined)
         shortlist_text = "\n".join([product_brief(it) for it in state.shortlist[:8]])
+        # Simulated tooling for coordinator (Wardrobe Agent)
+        tools_text = simulate_tool_data(coord_meta, state.shortlist, state.query)
+        tools_block = f"\nИНСТРУМЕНТЫ (сводка):\n{tools_text}\n" if tools_text else ""
 
         system_prompt = f"""
-Вы — {name}. Вы координируете агентов и принимаете финальное решение.
-Цель: выбрать один лучший товар для рекомендации пользователю с учётом запроса и мнений агентов.
-Критерии: соответствие запросу, качество (mark), уместность бренда/категории/цвета.
-Выберите ровно один товар из SHORTLIST и верните JSON с ключами: index, name, reason.
-Где index — индекс позиции в SHORTLIST (начиная с 1) вашего выбора, reason — краткое обоснование.
-Не добавляйте ничего кроме JSON.
+Вы — {name}. Роль: {role}. Личность: {persona}.
+Вы руководите обсуждением, формулируете гипотезу о стиле/потребности пользователя и принимаете финальное решение.
+Цель: выбрать один лучший товар для рекомендации с учётом запроса, шорт-листа, мнений агентов и данных инструментов.
+Критерии: соответствие запросу, уместность для ситуации (occasion), качество (mark), цвет/категория/бренд.
+Верните строго JSON с ключами: index, name, reason — где index это номер позиции из SHORTLIST (начиная с 1), reason — краткое обоснование.
+Только JSON, без лишнего текста.
 """.strip()
         user_prompt = f"""
 USER QUERY:
@@ -370,7 +503,7 @@ USER QUERY:
 
 SHORTLIST (нумерация с 1):
 {shortlist_text}
-
+{tools_block}
 AGENTS SUGGESTIONS:
 {combined_text}
 """.strip()
