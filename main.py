@@ -76,12 +76,16 @@ def read_agents(csv_path: str) -> List[Dict[str, Any]]:
 
 
 def load_catalog(path: str) -> pd.DataFrame:
-    # The file appears to be TSV (tab-separated)
+    # Try to auto-detect delimiter first for robustness
     try:
-        return pd.read_csv(path, sep='\t')
+        return pd.read_csv(path, sep=None, engine='python')
     except Exception:
-        # Fallback to comma
-        return pd.read_csv(path)
+        try:
+            # Common case: TSV
+            return pd.read_csv(path, sep='\t')
+        except Exception:
+            # Fallback to comma
+            return pd.read_csv(path)
 
 
 def join_fields(row: pd.Series) -> str:
@@ -97,30 +101,88 @@ def join_fields(row: pd.Series) -> str:
 
 
 def search_catalog(df: pd.DataFrame, query: str, top_k: int = 20) -> pd.DataFrame:
+    """
+    Memory-efficient search across all fields without creating large helper columns.
+    Computes per-row scores on the fly and keeps only top_k candidates in memory.
+    """
     if df is None or df.empty:
         return df
-    q = query.lower().strip()
+    q = str(query).lower().strip()
     if not q:
         return df.head(top_k)
-    # Precompute text corpus for scoring
-    if '_joined_text' not in df.columns:
-        df = df.copy()
-        df['_joined_text'] = df.apply(join_fields, axis=1).str.lower()
-    # Simple score: count of query keywords present
+
     keywords = [w for w in q.replace(',', ' ').split() if len(w) > 1]
-    def score(text: str) -> int:
-        return sum(1 for w in keywords if w in text)
-    scores = df['_joined_text'].apply(score)
-    df2 = df.assign(_score=scores)
-    # Also prioritize by exact color/brand/name keyword matches if present
+    if not keywords:
+        return df.head(top_k)
+
+    import heapq
+
+    heap: list[tuple[int, Any]] = []  # min-heap of (score, index)
+    max_score = 0
+    cols = list(df.columns)
+
+    # Iterate row-wise to avoid allocating an extra concatenated text column
+    for idx, row in df.iterrows():
+        score = 0
+        for col in cols:
+            try:
+                val = row[col]
+            except Exception:
+                continue
+            if pd.isna(val):
+                continue
+            try:
+                t = str(val).lower()
+            except Exception:
+                t = ''
+            if not t:
+                continue
+            for w in keywords:
+                if w in t:
+                    score += 1
+        if score > max_score:
+            max_score = score
+        # Maintain top_k heap
+        if len(heap) < top_k:
+            heapq.heappush(heap, (score, idx))
+        else:
+            if score > heap[0][0]:
+                heapq.heapreplace(heap, (score, idx))
+
+    if not heap:
+        return df.head(0)
+
+    # Extract and sort by score desc
+    items = [heapq.heappop(heap) for _ in range(len(heap))]
+    items.sort(key=lambda x: x[0], reverse=True)
+
+    # Optionally filter zero-score if there is at least one positive
+    if max_score > 0:
+        ordered = [(idx, sc) for sc, idx in items if sc > 0]
+    else:
+        ordered = [(idx, sc) for sc, idx in items]
+
+    if not ordered:
+        return df.head(0)
+
+    indices = [idx for idx, _ in ordered]
+    scores = [sc for _, sc in ordered]
+
+    result = df.loc[indices].copy()
+    result['_score'] = scores
+    # Secondary small boosts across common fields (without extra allocations)
     for col in ['name', 'brand', 'category', 'color', 'colors', 'keyword', 'kinds']:
-        if col in df2.columns:
-            df2['_score'] += df2[col].astype(str).str.lower().apply(lambda t: 1 if any(w in t for w in keywords) else 0)
-    df2 = df2.sort_values(by=['_score'], ascending=False)
-    # Filter out zero-score unless everything is zero
-    if df2['_score'].max() > 0:
-        df2 = df2[df2['_score'] > 0]
-    return df2.head(top_k)
+        if col in result.columns:
+            try:
+                result['_score'] = result.apply(
+                    lambda r, c=col: r['_score'] + (1 if any(w in str(r.get(c, '')).lower() for w in keywords) else 0),
+                    axis=1
+                )
+            except Exception:
+                pass
+
+    result = result.sort_values(by=['_score'], ascending=False)
+    return result.head(top_k)
 
 
 class HFChat:
@@ -327,6 +389,49 @@ def make_coordinator_node(agent: Dict[str, Any], llm: HFChat):
     return node
 
 
+def make_critic_node():
+    name = "Critic"
+
+    def node(state: RecoState):
+        # If coordinator already set a final recommendation, do nothing
+        final_obj = state.get('final')
+        if final_obj:
+            return state
+
+        sl = state.get('shortlist')
+        # Prefer taking from shortlist if available
+        if isinstance(sl, pd.DataFrame) and not sl.empty:
+            selected_row = sl.head(1).iloc[0]
+            console.print(Panel(Text(
+                "Координатор не смог выбрать. Критик выбирает минимально приемлемый вариант из шорт-листа.",
+                style="italic cyan"
+            ), title=f"{name}", border_style="cyan"))
+            state['final'] = selected_row.to_dict()
+            return state
+
+        # Fallback to any item from the catalog
+        cat = state.get('catalog')
+        if isinstance(cat, pd.DataFrame) and not cat.empty:
+            # Ensure there is at least one column to select; otherwise row will be empty
+            if cat.shape[1] > 0:
+                selected_row = cat.reset_index(drop=True).iloc[0]
+                console.print(Panel(Text(
+                    "Шорт-лист пуст. Критик выбирает первый доступный товар из каталога.",
+                    style="italic cyan"
+                ), title=f"{name}", border_style="cyan"))
+                state['final'] = selected_row.to_dict()
+            else:
+                console.print(Panel(Text(
+                    "Критик: каталог содержит 0 колонок — нечего выбрать. Проверьте формат файла каталога.",
+                    style="red"
+                ), title=f"{name}", border_style="red"))
+        else:
+            console.print(Panel(Text("Критик: нет данных каталога для выбора.", style="red"), title=f"{name}", border_style="red"))
+        return state
+
+    return node
+
+
 def build_graph(agents: List[Dict[str, Any]], llm: HFChat):
     # Determine coordinator: Wardrobe Agent if present, else last
     coord_idx = None
@@ -361,6 +466,8 @@ def build_graph(agents: List[Dict[str, Any]], llm: HFChat):
 
     # Coordinator node
     workflow.add_node('coordinator', make_coordinator_node(agents[coord_idx], llm))
+    # Critic node (fallback)
+    workflow.add_node('critic', make_critic_node())
 
     # Edges: linear sequence
     workflow.set_entry_point('prepare')
@@ -369,7 +476,8 @@ def build_graph(agents: List[Dict[str, Any]], llm: HFChat):
         workflow.add_edge(prev, node_name)
         prev = node_name
     workflow.add_edge(prev, 'coordinator')
-    workflow.add_edge('coordinator', END)
+    workflow.add_edge('coordinator', 'critic')
+    workflow.add_edge('critic', END)
 
     return workflow.compile()
 
